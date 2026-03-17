@@ -67,6 +67,33 @@ async def startup():
     logger.info("Database initialized")
 
 
+def _extract_source(url):
+    if not url:
+        return "Unknown"
+    import re
+    m = re.search(r'https?://(?:www\.)?([^/]+)', url)
+    if m:
+        domain = m.group(1)
+        names = {
+            "ee.co.uk": "EE", "three.co.uk": "Three",
+            "vodafone.co.uk": "Vodafone", "o2.co.uk": "O2",
+            "giffgaff.com": "giffgaff", "voxi.co.uk": "VOXI",
+            "tescomobile.com": "Tesco Mobile", "mobile.asda.com": "Asda Mobile",
+            "idmobile.co.uk": "iD Mobile", "lycamobile.co.uk": "Lyca Mobile",
+            "talkmobile.co.uk": "Talkmobile",
+            "uswitch.com": "uSwitch", "moneysupermarket.com": "MoneySupermarket",
+            "moneysavingexpert.com": "MoneySavingExpert",
+            "mobilephonesdirect.co.uk": "Mobile Phones Direct",
+            "carphonewarehouse.com": "Carphone Warehouse",
+            "currys.co.uk": "Currys",
+        }
+        for k, v in names.items():
+            if k in domain:
+                return v
+        return domain
+    return "Unknown"
+
+
 @app.get("/api/plans")
 async def get_plans(scrape_date: Optional[str] = None):
     async with async_session() as session:
@@ -77,9 +104,13 @@ async def get_plans(scrape_date: Optional[str] = None):
             "id": p.id,
             "name": p.name,
             "provider_name": p.provider.name if p.provider else "Unknown",
+            "provider_type": p.provider.provider_type if p.provider else "unknown",
+            "source_site": _extract_source(p.url),
             "data_gb": -1 if p.data_unlimited else (p.data_gb or 0),
             "price": p.current_price if p.current_price is not None else 0.0,
             "contract_length": p.contract_months or 1,
+            "is_5g": p.is_5g,
+            "extras": p.extras or "",
             "url": p.url,
             "last_updated": p.last_seen.isoformat() if p.last_seen else None
         } for p in plans]
