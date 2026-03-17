@@ -2,145 +2,108 @@ import re
 import json
 import logging
 from typing import List
+from bs4 import BeautifulSoup
 from .base import BaseScraper, ScrapedPlan
+from .playwright_helper import fetch_page_content
 
 logger = logging.getLogger(__name__)
 
-NETWORK_NAMES = [
-    "EE",
-    "Three",
-    "O2",
-    "Vodafone",
-    "Sky Mobile",
-    "iD Mobile",
-    "Tesco Mobile",
-    "VOXI",
-    "giffgaff",
-    "Lebara",
-    "Smarty",
-    "Lyca Mobile",
-    "BT Mobile",
-    "Asda Mobile",
-    "Plusnet",
-]
-
-PAT_TABLE_ROW = re.compile(r'(?s)<tr[^>]*>(.*?)</tr>')
-PAT_TABLE_CELL = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL)
-PAT_HTML_TAG = re.compile(r'<[^>]+>')
-PAT_PRICE = re.compile(r'(\d+(?:\.\d+)?)\s*(?:/\s*mo|p/?m|per\s+month|a\s+month)')
-PAT_DATA_GB = re.compile(r'(\d+)\s*GB', re.IGNORECASE)
-PAT_UNLIMITED = re.compile(r'unlimited\s+data', re.IGNORECASE)
-PAT_MONTH = re.compile(r'(\d+)\s*month', re.IGNORECASE)
-PAT_CARD = re.compile(
-    r'(?s)class="[^"]*(?:deal|offer|pick|result|listing|card)[^"]*"[^>]*>'
-    r'(.*?)</(?:div|section|article|li)>'
-)
-PAT_DATA_PRICE = re.compile(
-    r'(\d+)\s*GB[^0-9]{0,80}(\d+(?:\.\d+)?)\s*(?:/?\s*(?:mo|pm|p/m|per\s+month))',
-    re.IGNORECASE,
-)
-PAT_PRICE_DATA = re.compile(
-    r'(\d+(?:\.\d+)?)\s*(?:/?\s*(?:mo|pm|p/m|per\s+month))[^0-9]{0,80}(\d+)\s*GB',
-    re.IGNORECASE,
-)
-
-
 class MoneySavingExpertScraper(BaseScraper):
     provider_name = "MoneySavingExpert"
-    provider_slug = "mse"
+    provider_slug = "moneysavingexpert"
     provider_type = "affiliate"
-    base_url = "https://www.moneysavingexpert.com/phones/cheap-sim-only-deals/"
+    base_url = "https://www.moneysavingexpert.com/cheap-mobile-phones/"
+    urls = ["https://www.moneysavingexpert.com/cheap-mobile-phones/"]
 
     async def scrape(self) -> List[ScrapedPlan]:
-        plans: List[ScrapedPlan] = []
-        try:
-            resp = await self.session.get(self.base_url)
-            html = resp.text
-            plans = self._parse_deal_tables(html)
-            if not plans:
-                plans = self._parse_deal_cards(html)
-            if not plans:
-                plans = self._parse_inline_deals(html)
-            if not plans:
-                plans = await self._playwright_fallback()
-            plans = self._deduplicate(plans)
-            logger.info(f"MoneySavingExpert: Found {len(plans)} plans")
-        except Exception as e:
-            logger.error(f"MoneySavingExpert scrape error: {e}")
+        plans = []
+        for url in self.urls:
+            try:
+                try:
+                    resp = await self.session.get(url)
+                    html = resp.text
+                    if len(html) > 5000:
+                        found = self._parse(html, url)
+                        if found:
+                            plans.extend(found)
+                            logger.info(f"MoneySavingExpert: Found {len(found)} via httpx")
+                except Exception: pass
+                if len(plans) < 3:
+                    html = await fetch_page_content(url, wait_ms=15000)
+                    if html and len(html) > 5000:
+                        found = self._parse(html, url)
+                        plans.extend(found)
+                        logger.info(f"MoneySavingExpert: Found {len(found)} via Playwright")
+            except Exception as e:
+                logger.error(f"MoneySavingExpert error: {e}")
+        return self._dedupe(plans)
+
+    def _parse(self, html: str, url: str) -> List[ScrapedPlan]:
+        plans = []
+        patterns = [r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>']
+        for pat in patterns:
+            for m in re.finditer(pat, html, re.DOTALL):
+                try:
+                    data = json.loads(m.group(1))
+                    plans.extend(self._walk_json(data, url))
+                except: pass
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ")
+        prices = re.findall(r'[££](\d+(?:\.\d+)?)\s*(?:/)?(?:mo|pm|month)?', text, re.I)
+        data_vals = re.findall(r'(\d+)\s*GB', text, re.I)
+        has_5g = bool(re.search(r'5G', text))
+        seen = set()
+        data_list = list(data_vals)
+        for ps in prices:
+            try: price = float(ps)
+            except: continue
+            if price < 5 or price > 100 or price in seen: continue
+            seen.add(price)
+            gb = None
+            for d in data_list:
+                v = int(d)
+                if 1 <= v <= 500: gb = v; data_list.remove(d); break
+            name = f"MoneySavingExpert {gb}GB" if gb else "MoneySavingExpert Plan"
+            ext_id = f"moneysavingexpert_{price}_{gb or 0}"
+            plans.append(ScrapedPlan(name=name, price=price, data_gb=gb, data_unlimited=(gb is None), contract_months=1, url=url, is_5g=has_5g, external_id=ext_id))
         return plans
 
-    def _parse_deal_tables(self, html: str) -> List[ScrapedPlan]:
-        plans: List[ScrapedPlan] = []
-        for row_match in PAT_TABLE_ROW.finditer(html):
-            row_html = row_match.group(1)
-            cells = PAT_TABLE_CELL.findall(row_html)
-            if len(cells) < 2:
-                continue
-            row_text = PAT_HTML_TAG.sub(" ", row_html)
-            price_m = PAT_PRICE.search(row_text)
-            if not price_m:
-                continue
-            price = float(price_m.group(1))
-            if price <= 0 or price > 200:
-                continue
-            data_gb = None
-            data_unlimited = False
-            if PAT_UNLIMITED.search(row_text):
-                data_unlimited = True
-            else:
-                gb_m = PAT_DATA_GB.search(row_text)
-                if gb_m:
-                    data_gb = int(gb_m.group(1))
-            if not data_gb and not data_unlimited:
-                continue
-            network = self._find_network(row_text)
-            contract = 1
-            month_m = PAT_MONTH.search(row_text)
-            if month_m:
-                contract = int(month_m.group(1))
-            is_5g = "5g" in row_text.lower()
-            name = f"{network} " if network else ""
-            if data_unlimited:
-                name += "Unlimited Data"
-            elif data_gb:
-                name += f"{data_gb}GB"
-            data_tag = "unl" if data_unlimited else str(data_gb)
-            plans.append(ScrapedPlan(
-                name=name.strip(), price=price, data_gb=data_gb,
-                data_unlimited=data_unlimited, contract_months=contract,
-                url=self.base_url, is_5g=is_5g,
-                external_id=f"mse_{price}_{data_tag}",
-            ))
+    def _walk_json(self, data, url: str, depth=0) -> List[ScrapedPlan]:
+        if depth > 10: return []
+        plans = []
+        if isinstance(data, dict):
+            price = None
+            for k in ('price', 'monthlyPrice', 'monthlyCost', 'cost'):
+                if k in data:
+                    try:
+                        val = str(data[k]).replace('£', '').replace('£', '').replace('£', '')
+                        price = float(val)
+                        if 0 < price < 200: break
+                    except: pass
+            if price and 0 < price < 200:
+                gb = None
+                unlim = False
+                for k in ('data', 'dataAllowance', 'dataGb'):
+                    if k in data:
+                        val = str(data[k]).lower()
+                        if 'unlimited' in val: unlim = True
+                        else:
+                            mt = re.search(r'(\d+)', val)
+                            if mt: gb = int(mt.group(1))
+                        break
+                is5g = any('5g' in str(v).lower() for v in data.values() if isinstance(v, str))
+                pname = data.get('name', f"MoneySavingExpert {gb}GB" if gb else "MoneySavingExpert Unlimited" if unlim else "MoneySavingExpert Plan")
+                ext_id = f"moneysavingexpert_json_{price}_{gb or 0}"
+                plans.append(ScrapedPlan(name=pname, price=price, data_gb=gb if not unlim else None, data_unlimited=unlim, contract_months=1, url=url, is_5g=is5g, external_id=ext_id))
+            for v in data.values(): plans.extend(self._walk_json(v, url, depth+1))
+        elif isinstance(data, list):
+            for item in data: plans.extend(self._walk_json(item, url, depth+1))
         return plans
 
-    def _find_network(self, text: str) -> str:
-        text_lower = text.lower()
-        for net in NETWORK_NAMES:
-            if net.lower() in text_lower:
-                return net
-        return ""
-
-    def _deduplicate(self, plans: List[ScrapedPlan]) -> List[ScrapedPlan]:
-        seen: set = set()
-        unique: List[ScrapedPlan] = []
+    def _dedupe(self, plans: List[ScrapedPlan]) -> List[ScrapedPlan]:
+        seen = set()
+        out = []
         for p in plans:
-            if p.external_id and p.external_id not in seen:
-                seen.add(p.external_id)
-                unique.append(p)
-        return unique
-
-    async def _playwright_fallback(self) -> List[ScrapedPlan]:
-        try:
-            from .playwright_helper import fetch_page_content
-            html = await fetch_page_content(self.base_url, wait_ms=10000)
-            if html:
-                plans = self._parse_deal_tables(html)
-                if not plans:
-                    plans = self._parse_deal_cards(html)
-                if not plans:
-                    plans = self._parse_inline_deals(html)
-                return plans
-        except Exception as e:
-            logger.warning(f"MoneySavingExpert playwright fallback failed: {e}")
-        return []
-
+            k = (p.price, p.data_gb)
+            if k not in seen: seen.add(k); out.append(p)
+        return out

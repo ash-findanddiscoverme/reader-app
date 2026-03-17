@@ -2,174 +2,108 @@ import re
 import json
 import logging
 from typing import List
+from bs4 import BeautifulSoup
 from .base import BaseScraper, ScrapedPlan
 from .playwright_helper import fetch_page_content
 
 logger = logging.getLogger(__name__)
 
-
 class TescoMobileScraper(BaseScraper):
     provider_name = "Tesco Mobile"
-    provider_slug = "tesco-mobile"
+    provider_slug = "tesco_mobile"
     provider_type = "mvno"
     base_url = "https://www.tescomobile.com/sim-only"
+    urls = ["https://www.tescomobile.com/sim-only", "https://www.tescomobile.com/shop/sim-only-deals"]
 
     async def scrape(self) -> List[ScrapedPlan]:
-        plans: List[ScrapedPlan] = []
-        try:
-            # Try Tesco Mobile API endpoints
-            for api_url in [
-                "https://www.tescomobile.com/api/plans/sim-only",
-                "https://www.tescomobile.com/api/v1/tariffs",
-            ]:
-                try:
-                    api_resp = await self.session.get(
-                        api_url, headers={"Accept": "application/json"},
-                    )
-                    if api_resp.status_code == 200:
-                        try:
-                            plans = self._walk_json(api_resp.json())
-                            if plans:
-                                break
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                except Exception:
-                    continue
-
-            # Try httpx page fetch
-            if not plans:
-                resp = await self.session.get(self.base_url)
-                html = resp.text
-                if len(html) > 5000:
-                    plans = self._try_parse_json(html)
-                    if not plans:
-                        plans = self._try_parse_html(html)
-
-            # Playwright fallback
-            if not plans:
-                logger.info("Tesco Mobile: trying playwright")
-                html = await fetch_page_content(self.base_url, wait_ms=10000)
-                if html:
-                    plans = self._try_parse_json(html)
-                    if not plans:
-                        plans = self._try_parse_html(html)
-
-            self._deduplicate(plans)
-            logger.info(f"Tesco Mobile: scraped {len(plans)} plans")
-        except Exception as e:
-            logger.error(f"Tesco Mobile scrape error: {e}")
-        return plans
-
-    def _try_parse_json(self, html: str) -> List[ScrapedPlan]:
         plans = []
-        json_patterns = [
-            r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-            r'"plans"\s*:\s*(\[.*?\])\s*[,}]',
-            r'"tariffs"\s*:\s*(\[.*?\])\s*[,}]',
-            r'<script[^>]*type="application/json"[^>]*>(.*?)</script>',
-        ]
-        for pat in json_patterns:
-            for match in re.finditer(pat, html, re.DOTALL):
+        for url in self.urls:
+            try:
                 try:
-                    data = json.loads(match.group(1))
-                    extracted = self._walk_json(data)
-                    if extracted:
-                        return extracted
-                except (json.JSONDecodeError, TypeError):
-                    continue
+                    resp = await self.session.get(url)
+                    html = resp.text
+                    if len(html) > 5000:
+                        found = self._parse(html, url)
+                        if found:
+                            plans.extend(found)
+                            logger.info(f"Tesco Mobile: Found {len(found)} via httpx")
+                except Exception: pass
+                if len(plans) < 3:
+                    html = await fetch_page_content(url, wait_ms=15000)
+                    if html and len(html) > 5000:
+                        found = self._parse(html, url)
+                        plans.extend(found)
+                        logger.info(f"Tesco Mobile: Found {len(found)} via Playwright")
+            except Exception as e:
+                logger.error(f"Tesco Mobile error: {e}")
+        return self._dedupe(plans)
+
+    def _parse(self, html: str, url: str) -> List[ScrapedPlan]:
+        plans = []
+        patterns = [r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>']
+        for pat in patterns:
+            for m in re.finditer(pat, html, re.DOTALL):
+                try:
+                    data = json.loads(m.group(1))
+                    plans.extend(self._walk_json(data, url))
+                except: pass
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ")
+        prices = re.findall(r'[££](\d+(?:\.\d+)?)\s*(?:/)?(?:mo|pm|month)?', text, re.I)
+        data_vals = re.findall(r'(\d+)\s*GB', text, re.I)
+        has_5g = bool(re.search(r'5G', text))
+        seen = set()
+        data_list = list(data_vals)
+        for ps in prices:
+            try: price = float(ps)
+            except: continue
+            if price < 5 or price > 100 or price in seen: continue
+            seen.add(price)
+            gb = None
+            for d in data_list:
+                v = int(d)
+                if 1 <= v <= 500: gb = v; data_list.remove(d); break
+            name = f"Tesco Mobile {gb}GB" if gb else "Tesco Mobile Plan"
+            ext_id = f"tesco_mobile_{price}_{gb or 0}"
+            plans.append(ScrapedPlan(name=name, price=price, data_gb=gb, data_unlimited=(gb is None), contract_months=1, url=url, is_5g=has_5g, external_id=ext_id))
         return plans
 
-    def _walk_json(self, data, depth=0) -> List[ScrapedPlan]:
-        if depth > 10:
-            return []
+    def _walk_json(self, data, url: str, depth=0) -> List[ScrapedPlan]:
+        if depth > 10: return []
         plans = []
         if isinstance(data, dict):
-            price_keys = {"price", "monthlyPrice", "monthlyCost", "cost"}
-            data_keys = {"data", "dataAllowance", "dataGb", "allowance"}
-            found_price = None
-            found_data = None
-            for k in price_keys:
+            price = None
+            for k in ('price', 'monthlyPrice', 'monthlyCost', 'cost'):
                 if k in data:
                     try:
-                        found_price = float(data[k])
-                    except (ValueError, TypeError):
-                        pass
-                    break
-            for k in data_keys:
-                if k in data:
-                    found_data = data[k]
-                    break
-            if found_price and 3 <= found_price <= 100:
-                data_gb = None
-                is_unlimited = False
-                if isinstance(found_data, (int, float)):
-                    data_gb = int(found_data)
-                elif isinstance(found_data, str):
-                    m = re.search(r"(\d+)", found_data)
-                    if m:
-                        data_gb = int(m.group(1))
-                    if "unlimited" in found_data.lower():
-                        is_unlimited = True
-                name = data.get("name", data.get("title", ""))
-                if not name:
-                    name = f"Tesco Mobile {data_gb}GB" if data_gb else "Tesco Mobile Unlimited"
-                contract = 1
-                for ck in ("contractLength", "term", "duration"):
-                    if ck in data:
-                        try:
-                            contract = int(data[ck])
-                        except (ValueError, TypeError):
-                            pass
+                        val = str(data[k]).replace('£', '').replace('£', '').replace('£', '')
+                        price = float(val)
+                        if 0 < price < 200: break
+                    except: pass
+            if price and 0 < price < 200:
+                gb = None
+                unlim = False
+                for k in ('data', 'dataAllowance', 'dataGb'):
+                    if k in data:
+                        val = str(data[k]).lower()
+                        if 'unlimited' in val: unlim = True
+                        else:
+                            mt = re.search(r'(\d+)', val)
+                            if mt: gb = int(mt.group(1))
                         break
-                plans.append(ScrapedPlan(
-                    name=name, price=found_price, data_gb=data_gb,
-                    data_unlimited=is_unlimited or data.get("unlimitedData", False),
-                    url=self.base_url, contract_months=contract,
-                    is_5g="5g" in str(data).lower(),
-                    external_id=f"tesco-mobile_{found_price}_{data_gb or 'unlimited'}",
-                ))
-            for v in data.values():
-                plans.extend(self._walk_json(v, depth + 1))
+                is5g = any('5g' in str(v).lower() for v in data.values() if isinstance(v, str))
+                pname = data.get('name', f"Tesco Mobile {gb}GB" if gb else "Tesco Mobile Unlimited" if unlim else "Tesco Mobile Plan")
+                ext_id = f"tesco_mobile_json_{price}_{gb or 0}"
+                plans.append(ScrapedPlan(name=pname, price=price, data_gb=gb if not unlim else None, data_unlimited=unlim, contract_months=1, url=url, is_5g=is5g, external_id=ext_id))
+            for v in data.values(): plans.extend(self._walk_json(v, url, depth+1))
         elif isinstance(data, list):
-            for item in data:
-                plans.extend(self._walk_json(item, depth + 1))
+            for item in data: plans.extend(self._walk_json(item, url, depth+1))
         return plans
 
-    def _try_parse_html(self, html: str) -> List[ScrapedPlan]:
-        plans = []
+    def _dedupe(self, plans: List[ScrapedPlan]) -> List[ScrapedPlan]:
         seen = set()
-        pound = "\u00a3"
-        for price_m in re.finditer(pound + r"\s*(\d+(?:\.\d{1,2})?)", html):
-            price = float(price_m.group(1))
-            if price < 3 or price > 100:
-                continue
-            start = max(0, price_m.start() - 500)
-            end = min(len(html), price_m.end() + 500)
-            context = html[start:end]
-            gb_m = re.search(r"(\d+)\s*GB", context, re.IGNORECASE)
-            data_gb = int(gb_m.group(1)) if gb_m else None
-            unlimited = bool(re.search(r"unlimited", context, re.IGNORECASE))
-            key = (price, data_gb)
-            if key in seen:
-                continue
-            seen.add(key)
-            if not data_gb and not unlimited:
-                continue
-            label = f"{data_gb}GB" if data_gb else "Unlimited"
-            plans.append(ScrapedPlan(
-                name=f"Tesco Mobile {label}", price=price, data_gb=data_gb,
-                data_unlimited=unlimited and not data_gb, url=self.base_url,
-                external_id=f"tesco-mobile_{price}_{data_gb or 'unlimited'}",
-            ))
-        return plans
-
-    @staticmethod
-    def _deduplicate(plans: List[ScrapedPlan]):
-        seen = set()
-        i = 0
-        while i < len(plans):
-            if plans[i].external_id in seen:
-                plans.pop(i)
-            else:
-                seen.add(plans[i].external_id)
-                i += 1
+        out = []
+        for p in plans:
+            k = (p.price, p.data_gb)
+            if k not in seen: seen.add(k); out.append(p)
+        return out

@@ -2,216 +2,132 @@ import re
 import json
 import logging
 from typing import List
+from bs4 import BeautifulSoup
 from .base import BaseScraper, ScrapedPlan
 from .playwright_helper import fetch_page_content
 
 logger = logging.getLogger(__name__)
-
 
 class GiffgaffScraper(BaseScraper):
     provider_name = "giffgaff"
     provider_slug = "giffgaff"
     provider_type = "mvno"
     base_url = "https://www.giffgaff.com/sim-only-plans"
+    urls = [
+        "https://www.giffgaff.com/sim-only-plans",
+        "https://www.giffgaff.com/goodybags",
+    ]
 
     async def scrape(self) -> List[ScrapedPlan]:
-        plans: List[ScrapedPlan] = []
-        try:
-            # Try goodybag API endpoint first
+        plans = []
+        for url in self.urls:
             try:
-                api_resp = await self.session.get(
-                    "https://www.giffgaff.com/api/goodybag",
-                    headers={"Accept": "application/json"},
-                )
-                if api_resp.status_code == 200:
-                    try:
-                        plans = self._extract_from_api(api_resp.json())
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                try:
+                    resp = await self.session.get(url)
+                    html = resp.text
+                    if len(html) > 5000:
+                        found = self._parse(html, url)
+                        if found:
+                            plans.extend(found)
+                            logger.info(f"giffgaff: Found {len(found)} via httpx")
+                except Exception:
+                    pass
+                if len(plans) < 3:
+                    html = await fetch_page_content(url, wait_ms=15000)
+                    if html and len(html) > 5000:
+                        found = self._parse(html, url)
+                        plans.extend(found)
+                        logger.info(f"giffgaff: Found {len(found)} via Playwright")
             except Exception as e:
-                logger.debug(f"giffgaff API attempt failed: {e}")
+                logger.error(f"giffgaff error: {e}")
+        return self._dedupe(plans)
 
-            if not plans:
-                resp = await self.session.get(self.base_url)
-                html = resp.text
-                plans = self._try_parse_next_data(html)
-                if not plans:
-                    plans = self._try_parse_json_ld(html)
-                if not plans:
-                    plans = self._try_parse_html_regex(html)
-
-            if not plans:
-                logger.info("giffgaff: httpx got no plans, trying playwright")
-                html = await fetch_page_content(self.base_url, wait_ms=10000)
-                plans = self._try_parse_next_data(html)
-                if not plans:
-                    plans = self._try_parse_html_regex(html)
-
-            self._deduplicate(plans)
-            logger.info(f"giffgaff: scraped {len(plans)} plans")
-        except Exception as e:
-            logger.error(f"giffgaff scrape error: {e}")
-        return plans
-
-    def _extract_from_api(self, data) -> List[ScrapedPlan]:
+    def _parse(self, html: str, url: str) -> List[ScrapedPlan]:
         plans = []
-        items = data if isinstance(data, list) else data.get("goodybags", data.get("plans", []))
-        for p in items:
+        patterns = [
+            r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+            r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});',
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, html, re.DOTALL):
+                try:
+                    data = json.loads(m.group(1))
+                    plans.extend(self._walk_json(data, url))
+                except Exception:
+                    pass
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ")
+        prices = re.findall(r'[££](\d+(?:\.\d+)?)\s*(?:/)?(?:mo|pm|month)?', text, re.I)
+        data_vals = re.findall(r'(\d+)\s*GB', text, re.I)
+        has_5g = bool(re.search(r'5G', text))
+        seen = set()
+        data_list = list(data_vals)
+        for ps in prices:
             try:
-                price = float(p.get("price", p.get("monthlyPrice", 0)))
-                if price <= 0:
-                    continue
-                data_val = p.get("data", p.get("dataAllowance", p.get("dataGb")))
-                is_unlimited = p.get("unlimitedData", False)
-                if isinstance(data_val, str) and "unlimited" in data_val.lower():
-                    is_unlimited = True
-                    data_val = None
-                data_gb = int(data_val) if data_val and not is_unlimited else None
-                name = p.get("name", p.get("title", ""))
-                if not name:
-                    name = f"giffgaff {data_gb}GB" if data_gb else "giffgaff Unlimited"
-                plans.append(ScrapedPlan(
-                    name=name, price=price, data_gb=data_gb,
-                    data_unlimited=is_unlimited, url=self.base_url,
-                    is_5g=bool(p.get("is5g", p.get("fiveG", False))),
-                    external_id=f"giffgaff_{price}_{data_gb or 'unlimited'}",
-                ))
-            except (ValueError, TypeError, KeyError):
+                price = float(ps)
+            except ValueError:
                 continue
+            if price < 5 or price > 100 or price in seen:
+                continue
+            seen.add(price)
+            gb = None
+            for d in data_list:
+                v = int(d)
+                if 1 <= v <= 500:
+                    gb = v
+                    data_list.remove(d)
+                    break
+            name = f"giffgaff {gb}GB" if gb else "giffgaff Plan"
+            ext_id = f"giffgaff_{price}_{gb or 0}"
+            plans.append(ScrapedPlan(name=name, price=price, data_gb=gb, data_unlimited=(gb is None), contract_months=1, url=url, is_5g=has_5g, external_id=ext_id))
         return plans
 
-    def _try_parse_next_data(self, html: str) -> List[ScrapedPlan]:
-        plans = []
-        match = re.search(
-            r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL
-        )
-        if not match:
-            return plans
-        try:
-            data = json.loads(match.group(1))
-            page_props = data.get("props", {}).get("pageProps", {})
-            plan_list = (
-                page_props.get("plans")
-                or page_props.get("goodybags")
-                or page_props.get("simOnlyPlans")
-                or []
-            )
-            if not plan_list:
-                plan_list = self._find_plan_arrays(data)
-            for p in plan_list:
-                price = float(p.get("price", p.get("monthlyPrice", p.get("cost", 0))))
-                if price <= 0:
-                    continue
-                data_val = p.get("data", p.get("dataAllowance", p.get("dataGb")))
-                is_unlimited = p.get("unlimitedData", False)
-                if isinstance(data_val, str) and "unlimited" in data_val.lower():
-                    is_unlimited = True
-                    data_val = None
-                data_gb = int(data_val) if data_val and not is_unlimited else None
-                name = p.get("name", p.get("title", ""))
-                if not name:
-                    name = f"giffgaff {data_gb}GB" if data_gb else "giffgaff Unlimited"
-                plans.append(ScrapedPlan(
-                    name=name, price=price, data_gb=data_gb,
-                    data_unlimited=is_unlimited, url=self.base_url,
-                    external_id=f"giffgaff_{price}_{data_gb or 'unlimited'}",
-                ))
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.debug(f"giffgaff __NEXT_DATA__ parse failed: {e}")
-        return plans
-
-    def _find_plan_arrays(self, data, depth=0) -> list:
-        if depth > 6:
+    def _walk_json(self, data, url: str, depth=0) -> List[ScrapedPlan]:
+        if depth > 10:
             return []
-        if isinstance(data, list) and len(data) >= 2:
-            if all(isinstance(i, dict) and ("price" in i or "monthlyPrice" in i) for i in data[:3]):
-                return data
+        plans = []
         if isinstance(data, dict):
+            price = None
+            for k in ('price', 'monthlyPrice', 'monthlyCost', 'cost', 'goodieBagPrice'):
+                if k in data:
+                    try:
+                        val = str(data[k]).replace('£', '').replace('£', '').replace('£', '')
+                        price = float(val)
+                        if 0 < price < 200:
+                            break
+                    except (ValueError, TypeError):
+                        pass
+            if price and 0 < price < 200:
+                gb = None
+                unlim = False
+                for k in ('data', 'dataAllowance', 'dataGb', 'goodieBagData'):
+                    if k in data:
+                        val = str(data[k]).lower()
+                        if 'unlimited' in val:
+                            unlim = True
+                        else:
+                            mt = re.search(r'(\d+)', val)
+                            if mt:
+                                gb = int(mt.group(1))
+                        break
+                is5g = any('5g' in str(v).lower() for v in data.values() if isinstance(v, str))
+                pname = data.get('name', f"giffgaff {gb}GB" if gb else "giffgaff Unlimited" if unlim else "giffgaff Plan")
+                ext_id = f"giffgaff_json_{price}_{gb or 0}"
+                plans.append(ScrapedPlan(name=pname, price=price, data_gb=gb if not unlim else None, data_unlimited=unlim, contract_months=1, url=url, is_5g=is5g, external_id=ext_id))
             for v in data.values():
-                result = self._find_plan_arrays(v, depth + 1)
-                if result:
-                    return result
+                plans.extend(self._walk_json(v, url, depth + 1))
         elif isinstance(data, list):
             for item in data:
-                result = self._find_plan_arrays(item, depth + 1)
-                if result:
-                    return result
-        return []
-
-    def _try_parse_json_ld(self, html: str) -> List[ScrapedPlan]:
-        plans = []
-        for match in re.finditer(
-            r'<script[^>]*type="application/ld\\+json"[^>]*>(.*?)</script>',
-            html, re.DOTALL,
-        ):
-            try:
-                data = json.loads(match.group(1))
-                offers = []
-                if isinstance(data, dict):
-                    offers = data.get("offers", [])
-                    if isinstance(offers, dict):
-                        offers = offers.get("itemListElement", [offers])
-                    catalog = data.get("hasOfferCatalog", {})
-                    if isinstance(catalog, dict) and not offers:
-                        offers = catalog.get("itemListElement", [])
-                for offer in offers:
-                    price = float(offer.get("price", 0))
-                    if price <= 0:
-                        continue
-                    name = offer.get("name", "giffgaff plan")
-                    data_gb = None
-                    gb_match = re.search(r"(\d+)\s*GB", name, re.IGNORECASE)
-                    if gb_match:
-                        data_gb = int(gb_match.group(1))
-                    is_unlimited = "unlimited" in name.lower()
-                    plans.append(ScrapedPlan(
-                        name=name, price=price, data_gb=data_gb,
-                        data_unlimited=is_unlimited, url=self.base_url,
-                        external_id=f"giffgaff_{price}_{data_gb or 'unlimited'}",
-                    ))
-            except (json.JSONDecodeError, KeyError, TypeError):
-                continue
+                plans.extend(self._walk_json(item, url, depth + 1))
         return plans
 
-    def _try_parse_html_regex(self, html: str) -> List[ScrapedPlan]:
-        plans = []
+    def _dedupe(self, plans: List[ScrapedPlan]) -> List[ScrapedPlan]:
         seen = set()
-        pound_sign = chr(163)
-        for price_m in re.finditer(pound_sign + r'\s*(\d+(?:\.\d{1,2})?)', html):
-            price = float(price_m.group(1))
-            if price < 3 or price > 100:
-                continue
-            start = max(0, price_m.start() - 500)
-            end = min(len(html), price_m.end() + 500)
-            context = html[start:end]
-            gb_m = re.search(r'(\d+)\s*GB', context, re.IGNORECASE)
-            data_gb = int(gb_m.group(1)) if gb_m else None
-            unlimited = bool(re.search(r'unlimited\s*data', context, re.IGNORECASE))
-            key = (price, data_gb)
-            if key in seen:
-                continue
-            seen.add(key)
-            if data_gb:
-                label = f"{data_gb}GB"
-            elif unlimited:
-                label = "Unlimited"
-            else:
-                continue
-            plans.append(ScrapedPlan(
-                name=f"giffgaff {label}", price=price, data_gb=data_gb,
-                data_unlimited=unlimited and not data_gb, url=self.base_url,
-                external_id=f"giffgaff_{price}_{data_gb or 'unlimited'}",
-            ))
-        return plans
-
-    @staticmethod
-    def _deduplicate(plans: List[ScrapedPlan]):
-        seen = set()
-        i = 0
-        while i < len(plans):
-            if plans[i].external_id in seen:
-                plans.pop(i)
-            else:
-                seen.add(plans[i].external_id)
-                i += 1
-
+        out = []
+        for p in plans:
+            k = (p.price, p.data_gb)
+            if k not in seen:
+                seen.add(k)
+                out.append(p)
+        return out

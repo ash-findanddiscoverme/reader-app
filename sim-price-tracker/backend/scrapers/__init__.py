@@ -8,7 +8,7 @@ from .o2 import O2Scraper
 
 # MVNOs
 from .giffgaff import GiffgaffScraper
-from .voxi import VoxiScraper
+from .voxi import VOXIScraper
 from .tesco_mobile import TescoMobileScraper
 from .asda_mobile import AsdaMobileScraper
 from .id_mobile import IDMobileScraper
@@ -19,8 +19,8 @@ from .talkmobile import TalkmobileScraper
 from .uswitch import USwitchScraper
 from .moneysupermarket import MoneySupermarketScraper
 from .moneysavingexpert import MoneySavingExpertScraper
-from .mobile_phones_direct import MobilePhonesDirectScraper
-from .carphone_warehouse import CarphoneWarehouseScraper
+from .mobilephonesdirect import MobilePhonesDirectScraper
+from .carphonewarehouse import CarphoneWarehouseScraper
 
 SCRAPERS = [
     # MNOs
@@ -30,7 +30,7 @@ SCRAPERS = [
     O2Scraper,
     # MVNOs
     GiffgaffScraper,
-    VoxiScraper,
+    VOXIScraper,
     TescoMobileScraper,
     AsdaMobileScraper,
     IDMobileScraper,

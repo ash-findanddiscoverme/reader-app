@@ -2,173 +2,108 @@ import re
 import json
 import logging
 from typing import List
+from bs4 import BeautifulSoup
 from .base import BaseScraper, ScrapedPlan
 from .playwright_helper import fetch_page_content
 
 logger = logging.getLogger(__name__)
 
-
 class IDMobileScraper(BaseScraper):
     provider_name = "iD Mobile"
-    provider_slug = "id-mobile"
+    provider_slug = "id_mobile"
     provider_type = "mvno"
     base_url = "https://www.idmobile.co.uk/sim-only"
+    urls = ["https://www.idmobile.co.uk/sim-only", "https://www.idmobile.co.uk/"]
 
     async def scrape(self) -> List[ScrapedPlan]:
-        plans: List[ScrapedPlan] = []
-        try:
-            # Try iD Mobile API endpoints (Three network)
-            for api_url in [
-                "https://www.idmobile.co.uk/api/plans/sim-only",
-                "https://www.idmobile.co.uk/api/v1/deals",
-            ]:
-                try:
-                    api_resp = await self.session.get(
-                        api_url, headers={"Accept": "application/json"},
-                    )
-                    if api_resp.status_code == 200:
-                        try:
-                            plans = self._extract_plans(api_resp.json())
-                            if plans:
-                                break
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                except Exception:
-                    continue
-
-            # Try httpx page fetch
-            if not plans:
-                resp = await self.session.get(self.base_url)
-                html = resp.text
-                if len(html) > 3000:
-                    plans = self._try_parse_json(html)
-                    if not plans:
-                        plans = self._parse_html(html)
-
-            # Playwright fallback
-            if not plans:
-                logger.info("iD Mobile: trying playwright")
-                html = await fetch_page_content(
-                    self.base_url, wait_ms=12000,
-                    selector='[class*="plan"], [class*="tariff"], [class*="deal"]',
-                )
-                if html:
-                    plans = self._try_parse_json(html)
-                    if not plans:
-                        plans = self._parse_html(html)
-
-            self._deduplicate(plans)
-            logger.info(f"iD Mobile: scraped {len(plans)} plans")
-        except Exception as e:
-            logger.error(f"iD Mobile scrape error: {e}")
-        return plans
-
-    def _try_parse_json(self, html: str) -> List[ScrapedPlan]:
         plans = []
-        patterns = [
-            r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
-            r'<script[^>]*type="application/json"[^>]*>(.*?)</script>',
-        ]
-        for pat in patterns:
-            for match in re.finditer(pat, html, re.DOTALL):
-                raw = match.group(1).strip()
-                if len(raw) < 50:
-                    continue
+        for url in self.urls:
+            try:
                 try:
-                    data = json.loads(raw)
-                    extracted = self._extract_plans(data)
-                    if extracted:
-                        return extracted
-                except (json.JSONDecodeError, TypeError):
-                    continue
+                    resp = await self.session.get(url)
+                    html = resp.text
+                    if len(html) > 5000:
+                        found = self._parse(html, url)
+                        if found:
+                            plans.extend(found)
+                            logger.info(f"iD Mobile: Found {len(found)} via httpx")
+                except Exception: pass
+                if len(plans) < 3:
+                    html = await fetch_page_content(url, wait_ms=15000)
+                    if html and len(html) > 5000:
+                        found = self._parse(html, url)
+                        plans.extend(found)
+                        logger.info(f"iD Mobile: Found {len(found)} via Playwright")
+            except Exception as e:
+                logger.error(f"iD Mobile error: {e}")
+        return self._dedupe(plans)
+
+    def _parse(self, html: str, url: str) -> List[ScrapedPlan]:
+        plans = []
+        patterns = [r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>']
+        for pat in patterns:
+            for m in re.finditer(pat, html, re.DOTALL):
+                try:
+                    data = json.loads(m.group(1))
+                    plans.extend(self._walk_json(data, url))
+                except: pass
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ")
+        prices = re.findall(r'[££](\d+(?:\.\d+)?)\s*(?:/)?(?:mo|pm|month)?', text, re.I)
+        data_vals = re.findall(r'(\d+)\s*GB', text, re.I)
+        has_5g = bool(re.search(r'5G', text))
+        seen = set()
+        data_list = list(data_vals)
+        for ps in prices:
+            try: price = float(ps)
+            except: continue
+            if price < 5 or price > 100 or price in seen: continue
+            seen.add(price)
+            gb = None
+            for d in data_list:
+                v = int(d)
+                if 1 <= v <= 500: gb = v; data_list.remove(d); break
+            name = f"iD Mobile {gb}GB" if gb else "iD Mobile Plan"
+            ext_id = f"id_mobile_{price}_{gb or 0}"
+            plans.append(ScrapedPlan(name=name, price=price, data_gb=gb, data_unlimited=(gb is None), contract_months=1, url=url, is_5g=has_5g, external_id=ext_id))
         return plans
 
-    def _extract_plans(self, data, depth=0) -> List[ScrapedPlan]:
-        if depth > 10:
-            return []
+    def _walk_json(self, data, url: str, depth=0) -> List[ScrapedPlan]:
+        if depth > 10: return []
         plans = []
         if isinstance(data, dict):
-            price_val = data.get("price", data.get("monthlyPrice", data.get("monthlyCost")))
-            if price_val is not None:
-                try:
-                    price = float(price_val)
-                    if 1 <= price <= 100:
-                        dv = data.get("data", data.get("dataAllowance", data.get("dataGb")))
-                        data_gb = None
-                        is_unlimited = False
-                        if isinstance(dv, (int, float)):
-                            data_gb = int(dv)
-                        elif isinstance(dv, str):
-                            m = re.search(r"(\d+)", dv)
-                            if m:
-                                data_gb = int(m.group(1))
-                            if "unlimited" in dv.lower():
-                                is_unlimited = True
-                        name = data.get("name", data.get("title", ""))
-                        if not name:
-                            name = f"iD Mobile {data_gb}GB" if data_gb else "iD Mobile Plan"
-                        is_5g = "5g" in str(data).lower()
-                        contract = 1
-                        for ck in ("contractLength", "term", "duration"):
-                            if ck in data:
-                                try:
-                                    contract = int(data[ck])
-                                except (ValueError, TypeError):
-                                    pass
-                                break
-                        plans.append(ScrapedPlan(
-                            name=name, price=price, data_gb=data_gb,
-                            data_unlimited=is_unlimited, url=self.base_url,
-                            is_5g=is_5g, contract_months=contract,
-                            external_id=f"id-mobile_{price}_{data_gb or 'unlimited'}",
-                        ))
-                except (ValueError, TypeError):
-                    pass
-            for v in data.values():
-                plans.extend(self._extract_plans(v, depth + 1))
+            price = None
+            for k in ('price', 'monthlyPrice', 'monthlyCost', 'cost'):
+                if k in data:
+                    try:
+                        val = str(data[k]).replace('£', '').replace('£', '').replace('£', '')
+                        price = float(val)
+                        if 0 < price < 200: break
+                    except: pass
+            if price and 0 < price < 200:
+                gb = None
+                unlim = False
+                for k in ('data', 'dataAllowance', 'dataGb'):
+                    if k in data:
+                        val = str(data[k]).lower()
+                        if 'unlimited' in val: unlim = True
+                        else:
+                            mt = re.search(r'(\d+)', val)
+                            if mt: gb = int(mt.group(1))
+                        break
+                is5g = any('5g' in str(v).lower() for v in data.values() if isinstance(v, str))
+                pname = data.get('name', f"iD Mobile {gb}GB" if gb else "iD Mobile Unlimited" if unlim else "iD Mobile Plan")
+                ext_id = f"id_mobile_json_{price}_{gb or 0}"
+                plans.append(ScrapedPlan(name=pname, price=price, data_gb=gb if not unlim else None, data_unlimited=unlim, contract_months=1, url=url, is_5g=is5g, external_id=ext_id))
+            for v in data.values(): plans.extend(self._walk_json(v, url, depth+1))
         elif isinstance(data, list):
-            for item in data:
-                plans.extend(self._extract_plans(item, depth + 1))
+            for item in data: plans.extend(self._walk_json(item, url, depth+1))
         return plans
 
-    def _parse_html(self, html: str) -> List[ScrapedPlan]:
-        plans = []
+    def _dedupe(self, plans: List[ScrapedPlan]) -> List[ScrapedPlan]:
         seen = set()
-        pound = "\u00a3"
-        for price_m in re.finditer(pound + r"\s*(\d+(?:\.\d{1,2})?)", html):
-            price = float(price_m.group(1))
-            if price < 2 or price > 100:
-                continue
-            start = max(0, price_m.start() - 600)
-            end = min(len(html), price_m.end() + 600)
-            ctx = html[start:end]
-            gb_m = re.search(r"(\d+)\s*GB", ctx, re.IGNORECASE)
-            data_gb = int(gb_m.group(1)) if gb_m else None
-            unlimited = bool(re.search(r"unlimited\s*data", ctx, re.IGNORECASE))
-            is_5g = bool(re.search(r"5G", ctx))
-            key = (price, data_gb)
-            if key in seen:
-                continue
-            seen.add(key)
-            if not data_gb and not unlimited:
-                continue
-            label = f"{data_gb}GB" if data_gb else "Unlimited"
-            plans.append(ScrapedPlan(
-                name=f"iD Mobile {label}", price=price, data_gb=data_gb,
-                data_unlimited=unlimited and not data_gb, url=self.base_url,
-                is_5g=is_5g,
-                external_id=f"id-mobile_{price}_{data_gb or 'unlimited'}",
-            ))
-        return plans
-
-    @staticmethod
-    def _deduplicate(plans: List[ScrapedPlan]):
-        seen = set()
-        i = 0
-        while i < len(plans):
-            if plans[i].external_id in seen:
-                plans.pop(i)
-            else:
-                seen.add(plans[i].external_id)
-                i += 1
+        out = []
+        for p in plans:
+            k = (p.price, p.data_gb)
+            if k not in seen: seen.add(k); out.append(p)
+        return out

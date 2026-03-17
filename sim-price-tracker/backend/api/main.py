@@ -2,6 +2,7 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import List, Optional
+import hashlib
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -134,34 +135,64 @@ async def trigger_scrape():
     return {"status": "started"}
 
 
+def _generate_external_id(sp: ScrapedPlan, provider_slug: str) -> str:
+    """Generate a unique external_id if not provided."""
+    if sp.external_id:
+        return sp.external_id
+    # Create a hash-based ID from the plan attributes
+    data_str = "unl" if sp.data_unlimited else str(sp.data_gb or 0)
+    unique_str = f"{provider_slug}_{sp.price}_{data_str}_{sp.contract_months}m_{sp.name}"
+    return hashlib.md5(unique_str.encode()).hexdigest()[:16]
+
+
 async def save_plans(session, provider: Provider, plans: List[ScrapedPlan]):
+    """Save scraped plans to the database."""
+    saved_count = 0
     for sp in plans:
-        query = select(Plan).where(Plan.external_id == sp.external_id)
-        result = await session.execute(query)
-        plan = result.scalar()
+        try:
+            # Generate external_id if not provided
+            ext_id = _generate_external_id(sp, provider.slug)
+            
+            # Look up existing plan
+            query = select(Plan).where(Plan.external_id == ext_id)
+            result = await session.execute(query)
+            plan = result.scalar()
 
-        if not plan:
-            plan = Plan(
-                provider_id=provider.id,
-                name=sp.name,
-                url=sp.url,
-                data_gb=sp.data_gb,
-                data_unlimited=sp.data_unlimited,
-                contract_months=sp.contract_months,
-                is_5g=sp.is_5g,
-                minutes=sp.minutes,
-                texts=sp.texts,
-                external_id=sp.external_id,
-            )
-            session.add(plan)
-            await session.flush()
-        else:
-            plan.last_seen = datetime.utcnow()
+            if not plan:
+                plan = Plan(
+                    provider_id=provider.id,
+                    name=sp.name,
+                    url=sp.url,
+                    data_gb=sp.data_gb,
+                    data_unlimited=sp.data_unlimited,
+                    contract_months=sp.contract_months,
+                    is_5g=sp.is_5g,
+                    minutes=sp.minutes,
+                    texts=sp.texts,
+                    external_id=ext_id,
+                    extras=getattr(sp, 'extras', None),
+                )
+                session.add(plan)
+                await session.flush()
+            else:
+                # Update existing plan
+                plan.last_seen = datetime.utcnow()
+                plan.name = sp.name
+                plan.url = sp.url
+                plan.is_5g = sp.is_5g
+                if hasattr(sp, 'extras') and sp.extras:
+                    plan.extras = sp.extras
 
-        snapshot = PriceSnapshot(plan_id=plan.id, price=sp.price)
-        session.add(snapshot)
+            # Add price snapshot
+            snapshot = PriceSnapshot(plan_id=plan.id, price=sp.price)
+            session.add(snapshot)
+            saved_count += 1
+        except Exception as e:
+            logger.error(f"Error saving plan {sp.name}: {e}")
+            continue
 
     await session.commit()
+    return saved_count
 
 
 async def get_or_create_provider(session, name: str, slug: str, ptype: str) -> Provider:
@@ -175,9 +206,30 @@ async def get_or_create_provider(session, name: str, slug: str, ptype: str) -> P
     return provider
 
 
+async def scrape_single_provider(ScraperClass):
+    """Scrape a single provider and return results."""
+    scraper = ScraperClass()
+    try:
+        async with scraper:
+            plans = await scraper.scrape()
+        return {
+            "scraper": scraper,
+            "plans": plans,
+            "error": None
+        }
+    except Exception as e:
+        logger.error(f"Error scraping {scraper.provider_name}: {e}")
+        return {
+            "scraper": scraper,
+            "plans": [],
+            "error": str(e)
+        }
+
+
 async def run_scrape():
+    """Run all scrapers in parallel batches."""
     log_manager.is_scraping = True
-    provider_names = [scl.provider_name for scl in SCRAPERS]
+    provider_names = [scl.provider_name for scl in SCRAPESS]
 
     await log_manager.broadcast({
         "type": "progress",
@@ -189,45 +241,58 @@ async def run_scrape():
     })
 
     total_plans = 0
+    completed = 0
 
-    for i, ScraperClass in enumerate(SCRAPERS):
-        scraper = ScraperClass()
-        provider_name = scraper.provider_name
-
-        await log_manager.broadcast({"type": "provider_start", "provider": provider_name})
-        await log_manager.broadcast({"type": "log", "message": f"Scraping {provider_name}...", "level": "info"})
-
-        try:
-            async with scraper:
-                plans = await scraper.scrape()
-
-            async with async_session() as session:
-                provider = await get_or_create_provider(
-                    session,
-                    scraper.provider_name,
-                    scraper.provider_slug,
-                    scraper.provider_type
-                )
-                await save_plans(session, provider, plans)
-
-            plans_found = len(plans)
-            total_plans += plans_found
-
-            await log_manager.broadcast({"type": "provider_complete", "provider": provider_name, "plans_found": plans_found})
-            await log_manager.broadcast({"type": "log", "message": f"{provider_name}: Found {plans_found} plans", "level": "success"})
-
-        except Exception as e:
-            logger.error(f"Error scraping {provider_name}: {e}")
-            await log_manager.broadcast({"type": "provider_complete", "provider": provider_name, "error": str(e)})
-            await log_manager.broadcast({"type": "log", "message": f"{provider_name}: Error - {e}", "level": "error"})
-
-        await log_manager.broadcast({
-            "type": "progress",
-            "status": "running",
-            "total": len(SCRAPERS),
-            "completed": i + 1,
-            "plans_found": total_plans
-        })
+    # Run scrapers in parallel batches of 4
+    batch_size = 4
+    for i in range(0, len(SCRAPERS), batch_size):
+        batch = SCRAPERS[i:i + batch_size]
+        
+        # Notify start of batch
+        for ScraperClass in batch:
+            await log_manager.broadcast({"type": "provider_start", "provider": ScraperClass.provider_name})
+            await log_manager.broadcast({"type": "log", "message": f"Scraping {ScraperClass.provider_name}...", "level": "info"})
+        
+        # Run batch in parallel
+        results = await asyncio.gather(*[scrape_single_provider(sc) for sc in batch])
+        
+        # Process results
+        for result in results:
+            scraper = result["scraper"]
+            plans = result["plans"]
+            error = result["error"]
+            
+            if error:
+                await log_manager.broadcast({"type": "provider_complete", "provider": scraper.provider_name, "error": error})
+                await log_manager.broadcast({"type": "log", "message": f"{scraper.provider_name}: Error - {error}", "level": "error"})
+            else:
+                # Save to database
+                try:
+                    async with async_session() as session:
+                        provider = await get_or_create_provider(
+                            session,
+                            scraper.provider_name,
+                            scraper.provider_slug,
+                            scraper.provider_type
+                        )
+                        saved = await save_plans(session, provider, plans)
+                    logger.info(f"{\craper.provider_name}: Saved {saved} plans")
+                except Exception as e:
+                    logger.error(f"Error saving plans for {scraper.provider_name}: {e}")
+                
+                plans_found = len(plans)
+                total_plans += plans_found
+                await log_manager.broadcast({"type": "provider_complete", "provider": scraper.provider_name, "plans_found": plans_found})
+                await log_manager.broadcast({"type": "log", "message": f"{scraper.provider_name}: Found {plans_found} plans", "level": "success"})
+            
+            completed += 1
+            await log_manager.broadcast({
+                "type": "progress",
+                "status": "running",
+                "total": len(SCRAPERS),
+                "completed": completed,
+                "plans_found": total_plans
+            })
 
     await log_manager.broadcast({
         "type": "progress",

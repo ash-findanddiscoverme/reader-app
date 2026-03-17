@@ -8,12 +8,12 @@ from .playwright_helper import fetch_page_content
 
 logger = logging.getLogger(__name__)
 
-class MoneySupermarketScraper(BaseScraper):
-    provider_name = "MoneySupermarket"
-    provider_slug = "moneysupermarket"
+class CarphoneWarehouseScraper(BaseScraper):
+    provider_name = "Carphone Warehouse"
+    provider_slug = "carphonewarehouse"
     provider_type = "affiliate"
-    base_url = "https://www.moneysupermarket.com/mobile-phones/sim-only/"
-    urls = ["https://www.moneysupermarket.com/mobile-phones/sim-only/"]
+    base_url = "https://www.carphonewarehouse.com/sim-only-deals"
+    urls = ["https://www.carphonewarehouse.com/sim-only-deals"]
 
     async def scrape(self) -> List[ScrapedPlan]:
         plans = []
@@ -26,21 +26,21 @@ class MoneySupermarketScraper(BaseScraper):
                         found = self._parse(html, url)
                         if found:
                             plans.extend(found)
-                            logger.info(f"MoneySupermarket: Found {len(found)} via httpx")
+                            logger.info(f"Carphone Warehouse: Found {len(found)} via httpx")
                 except Exception: pass
                 if len(plans) < 3:
                     html = await fetch_page_content(url, wait_ms=15000)
                     if html and len(html) > 5000:
                         found = self._parse(html, url)
                         plans.extend(found)
-                        logger.info(f"MoneySupermarket: Found {len(found)} via Playwright")
+                        logger.info(f"Carphone Warehouse: Found {len(found)} via Playwright")
             except Exception as e:
-                logger.error(f"MoneySupermarket error: {e}")
+                logger.error(f"Carphone Warehouse error: {e}")
         return self._dedupe(plans)
 
     def _parse(self, html: str, url: str) -> List[ScrapedPlan]:
         plans = []
-        patterns = [r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', r'window\.__ssrState__\s*=\s*(\{[\S\s]*?\});']
+        patterns = [r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>']
         for pat in patterns:
             for m in re.finditer(pat, html, re.DOTALL):
                 try:
@@ -63,17 +63,10 @@ class MoneySupermarketScraper(BaseScraper):
             for d in data_list:
                 v = int(d)
                 if 1 <= v <= 500: gb = v; data_list.remove(d); break
-            name = f"MoneySupermarket {gb}GB" if gb else "MoneySupermarket Plan"
-            ext_id = f"moneysupermarket_{price}_{gb or 0}"
+            name = f"Carphone Warehouse {gb}GB" if gb else "Carphone Warehouse Plan"
+            ext_id = f"carphonewarehouse_{price}_{gb or 0}"
             plans.append(ScrapedPlan(name=name, price=price, data_gb=gb, data_unlimited=(gb is None), contract_months=1, url=url, is_5g=has_5g, external_id=ext_id))
         return plans
-
-    def _identify_network(self, data) -> str:
-        text = str(data).lower()
-        for n in ['ee', 'three', 'vodafone', 'o2', 'giffgaff', 'voxi', 'tesco', 'asda', 'id mobile', 'lyca', 'talk mobile']:
-            if n in text:
-                return n.title()
-        return "Unknown"
 
     def _walk_json(self, data, url: str, depth=0) -> List[ScrapedPlan]:
         if depth > 10: return []
@@ -98,11 +91,10 @@ class MoneySupermarketScraper(BaseScraper):
                             mt = re.search(r'(\d+)', val)
                             if mt: gb = int(mt.group(1))
                         break
-                network = self._identify_network(data)
                 is5g = any('5g' in str(v).lower() for v in data.values() if isinstance(v, str))
-                pname = data.get('name', f"{network} {gb}GB" if gb else f"{network} Unlimited" if unlim else f"{network} Plan")
-                ext_id = f"moneysupermarket_json_{price}_{gb or 0}"
-                plans.append(ScrapedPlan(name=pname, price=price, data_gb=gb if not unlim else None, data_unlimited=unlim, contract_months=1, url=url, is_5g=is5g, external_id=ext_id, network=network))
+                pname = data.get('name', f"Carphone Warehouse {gb}GB" if gb else "Carphone Warehouse Unlimited" if unlim else "Carphone Warehouse Plan")
+                ext_id = f"carphonewarehouse_json_{price}_{gb or 0}"
+                plans.append(ScrapedPlan(name=pname, price=price, data_gb=gb if not unlim else None, data_unlimited=unlim, contract_months=1, url=url, is_5g=is5g, external_id=ext_id))
             for v in data.values(): plans.extend(self._walk_json(v, url, depth+1))
         elif isinstance(data, list):
             for item in data: plans.extend(self._walk_json(item, url, depth+1))
